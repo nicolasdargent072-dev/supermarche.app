@@ -1,0 +1,962 @@
+import React, { useState, useEffect, useMemo } from 'react';
+// Importations Firebase
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, runTransaction, serverTimestamp, orderBy, limit, setLogLevel } from 'firebase/firestore';
+
+// Icônes Lucide pour l'esthétique
+import { Home, ShoppingBag, Truck, DollarSign, BarChart3, TrendingUp, Download, Settings, Users, Smile, Frown, Package, Wrench } from 'lucide-react';
+
+// Configuration Firebase
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Définition des VUES de navigation
+const VIEWS = {
+  HOME: 'Accueil',
+  PRODUCTS: 'Gestion des Produits',
+  ORDERING: 'Commande & Stocks',
+  EXPENSES: 'Dépense Quotidienne',
+  FINANCIAL: 'Bilan Financier',
+  STATS: 'Statistique du Jour',
+  PROFITABILITY: 'Analyse de Rentabilité',
+  EXPORT: 'Téléchargement des Bilans',
+};
+
+// --- Composant Principal de l'Application ---
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [currentView, setCurrentView] = useState(VIEWS.HOME);
+  const [products, setProducts] = useState([]);
+  const [dailyExpenses, setDailyExpenses] = useState({});
+  const [dailyStats, setDailyStats] = useState({});
+  const [stockHistory, setStockHistory] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // Initialisation et Authentification Firebase
+  useEffect(() => {
+    try {
+      setLogLevel('debug');
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const authInstance = getAuth(app);
+      
+      setDb(firestore);
+      setAuth(authInstance);
+
+      const unsubscribeAuth = onAuthStateChanged(authInstance, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          // console.log("Authenticated user:", user.uid);
+        } else {
+          // Attempt to sign in with custom token or anonymously
+          if (initialAuthToken) {
+            await signInWithCustomToken(authInstance, initialAuthToken);
+          } else {
+            await signInAnonymously(authInstance);
+          }
+        }
+      });
+      
+      return () => unsubscribeAuth();
+    } catch (e) {
+      setError("Erreur d'initialisation Firebase. Vérifiez la configuration.");
+      setIsLoading(false);
+      console.error("Firebase Init Error:", e);
+    }
+  }, []);
+
+  // Utilitaire pour créer la référence de collection Firestore (CORRIGÉ: 5 segments)
+  const getUserCollection = (collectionName) => {
+    if (!db || !userId) throw new Error("Database or User ID not ready.");
+    // Chemin correct: /artifacts/{appId}/users/{userId}/{collectionName}
+    const path = `/artifacts/${appId}/users/${userId}/${collectionName}`;
+    return collection(db, path);
+  };
+
+  // Chargement des données Firestore
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    try {
+      // 1. Produits
+      const qProducts = getUserCollection('products');
+      const unsubProducts = onSnapshot(qProducts, (snapshot) => {
+        setProducts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+        // console.log("Products loaded.");
+      }, (e) => console.error("Error loading products:", e));
+
+      // 2. Dépenses Quotidiennes (on va juste prendre les dernières, simplifiant pour la démo)
+      const qExpenses = query(getUserCollection('daily_expenses'), orderBy('date', 'desc'), limit(1));
+      const unsubExpenses = onSnapshot(qExpenses, (snapshot) => {
+        if (snapshot.docs.length > 0) {
+          setDailyExpenses(snapshot.docs[0].data());
+        } else {
+          setDailyExpenses({ date: new Date().toISOString().substring(0, 10), thievesLoss: 0, rentCost: 0, electricityCost: 0, salaries: 0, otherCosts: 0 });
+        }
+        // console.log("Expenses loaded.");
+      }, (e) => console.error("Error loading expenses:", e));
+
+      // 3. Statistiques du Jour
+      const qStats = query(getUserCollection('daily_stats'), orderBy('date', 'desc'), limit(1));
+      const unsubStats = onSnapshot(qStats, (snapshot) => {
+        if (snapshot.docs.length > 0) {
+          setDailyStats(snapshot.docs[0].data());
+        } else {
+          setDailyStats({ date: new Date().toISOString().substring(0, 10), notFounds: 0, tooExpensive: 0, thefts: 0, dirtComplaints: 0, dailySales: 0, productsCostTotal: 0 });
+        }
+        // console.log("Stats loaded.");
+        setIsLoading(false);
+      }, (e) => {
+        console.error("Error loading stats:", e);
+        setIsLoading(false);
+      });
+      
+      // 4. Historique des Stocks
+      const qStockHistory = query(getUserCollection('stock_history'), orderBy('date', 'desc'), limit(50));
+      const unsubStockHistory = onSnapshot(qStockHistory, (snapshot) => {
+        setStockHistory(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), date: doc.data().date.toDate() })));
+        // console.log("Stock history loaded.");
+      }, (e) => console.error("Error loading stock history:", e));
+
+      return () => {
+        unsubProducts();
+        unsubExpenses();
+        unsubStats();
+        unsubStockHistory();
+      };
+    } catch (e) {
+      console.error("Error setting up listeners:", e);
+      setError("Erreur lors de la configuration des écouteurs de données.");
+    }
+  }, [db, userId]);
+
+
+  // --- Logique d'Application (Fonctions d'écriture Firestore) ---
+
+  // Ajout/Modification de Produit
+  const handleSaveProduct = async (productData) => {
+    if (!db || !userId) return;
+    const productsRef = getUserCollection('products'); // Utilisation de l'utilitaire
+    const payload = { ...productData, lastUpdated: serverTimestamp() };
+
+    try {
+      if (productData.id) {
+        await updateDoc(doc(productsRef, productData.id), payload);
+        alertMessage("Produit mis à jour avec succès!");
+      } else {
+        await addDoc(productsRef, payload);
+        alertMessage("Produit ajouté avec succès!");
+      }
+    } catch (e) {
+      console.error("Error saving product: ", e);
+      alertMessage("Erreur lors de la sauvegarde du produit.", true);
+    }
+  };
+
+  // Suppression de Produit
+  const handleDeleteProduct = async (productId) => {
+    if (!db || !userId || !window.confirm("Êtes-vous sûr de vouloir supprimer ce produit?")) return;
+    
+    // CORRECTION: Utilisation de l'utilitaire pour obtenir la référence de document
+    const productDocRef = doc(getUserCollection('products'), productId); 
+    
+    try {
+      await deleteDoc(productDocRef);
+      alertMessage("Produit supprimé avec succès!");
+    } catch (e) {
+      console.error("Error deleting product: ", e);
+      alertMessage("Erreur lors de la suppression du produit.", true);
+    }
+  };
+
+  // Enregistrement d'une Transaction de Stock
+  const handleStockTransaction = async (productId, type, quantity) => {
+    if (!db || !userId) return;
+
+    // CORRECTION: Utilisation de l'utilitaire pour obtenir les références
+    const productRef = doc(getUserCollection('products'), productId);
+    const historyRef = getUserCollection('stock_history');
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const productDoc = await transaction.get(productRef);
+        if (!productDoc.exists()) {
+          throw "Produit inexistant!";
+        }
+
+        const newStock = type === 'IN' 
+          ? productDoc.data().stock + quantity
+          : productDoc.data().stock - quantity;
+
+        if (newStock < 0) {
+          throw "Stock insuffisant pour cette sortie.";
+        }
+
+        // 1. Mise à jour du stock du produit
+        transaction.update(productRef, { stock: newStock });
+
+        // 2. Enregistrement dans l'historique
+        transaction.set(doc(historyRef), {
+          productId,
+          productName: productDoc.data().name,
+          type,
+          quantity,
+          date: serverTimestamp(),
+        });
+      });
+
+      alertMessage(`Transaction de stock (${type}) réussie.`);
+    } catch (e) {
+      console.error("Error performing stock transaction: ", e);
+      alertMessage(e, true);
+    }
+  };
+
+  // Mise à jour des Dépenses Quotidiennes
+  const handleUpdateDailyExpenses = async (expenses) => {
+    if (!db || !userId) return;
+    const expensesRef = getUserCollection('daily_expenses'); // Utilisation de l'utilitaire
+    const dateStr = new Date().toISOString().substring(0, 10);
+    const todayDocRef = doc(expensesRef, dateStr);
+
+    try {
+      await setDoc(todayDocRef, { ...expenses, date: dateStr }, { merge: true });
+      alertMessage("Dépenses quotidiennes enregistrées.");
+    } catch (e) {
+      console.error("Error updating daily expenses: ", e);
+      alertMessage("Erreur lors de la mise à jour des dépenses.", true);
+    }
+  };
+
+  // Mise à jour des Statistiques du Jour
+  const handleUpdateDailyStats = async (stats) => {
+    if (!db || !userId) return;
+    const statsRef = getUserCollection('daily_stats'); // Utilisation de l'utilitaire
+    const dateStr = new Date().toISOString().substring(0, 10);
+    const todayDocRef = doc(statsRef, dateStr);
+
+    try {
+      await setDoc(todayDocRef, { ...stats, date: dateStr }, { merge: true });
+      alertMessage("Statistiques du jour enregistrées.");
+    } catch (e) {
+      console.error("Error updating daily stats: ", e);
+      alertMessage("Erreur lors de la mise à jour des statistiques.", true);
+    }
+  };
+
+  // Fonction utilitaire pour le Solde Journalier et les Marges
+  const calculateDailyMetrics = useMemo(() => {
+    const totalDailyRevenue = dailyStats.dailySales || 0;
+    const totalDailyCOGS = dailyStats.productsCostTotal || 0;
+    
+    // Total des dépenses
+    const totalDailyExpenses = (dailyExpenses.thievesLoss || 0) +
+                               (dailyExpenses.rentCost / 30 || 0) + // Simplification: loyer divisé par 30 jours
+                               (dailyExpenses.electricityCost / 30 || 0) + // Simplification: électricité divisée par 30 jours
+                               (dailyExpenses.salaries / 30 || 0) + // Simplification: salaires divisés par 30 jours
+                               (dailyExpenses.otherCosts || 0);
+
+    // Marge Brute
+    const grossMargin = totalDailyRevenue - totalDailyCOGS;
+    // Marge Nette (Bénéfice Net)
+    const netMargin = grossMargin - totalDailyExpenses;
+
+    // Solde Journalier (pour le bilan)
+    const dailyBalance = netMargin; // Le Solde Journalier est le Bénéfice Net (Marge Nette)
+
+    return {
+      totalDailyRevenue: totalDailyRevenue.toFixed(2),
+      totalDailyCOGS: totalDailyCOGS.toFixed(2),
+      totalDailyExpenses: totalDailyExpenses.toFixed(2),
+      grossMargin: grossMargin.toFixed(2),
+      netMargin: netMargin.toFixed(2),
+      dailyBalance: dailyBalance.toFixed(2)
+    };
+  }, [dailyStats, dailyExpenses]);
+
+
+  // --- Composant Modale/Alert personnalisé (pas d'alert()) ---
+  const [alert, setAlert] = useState(null);
+  const alertMessage = (message, isError = false) => {
+    setAlert({ message, isError });
+    setTimeout(() => setAlert(null), 3000);
+  };
+
+  const AlertModal = () => alert && (
+    <div className={`fixed bottom-4 right-4 z-50 p-4 rounded-lg shadow-xl text-white transition-opacity duration-300 ${alert.isError ? 'bg-red-500' : 'bg-green-500'}`}>
+      {alert.message}
+    </div>
+  );
+
+  // --- Composants de Vue (Séparés par couleur) ---
+
+  // 1. Accueil / Identité
+  const HomeView = ({ color }) => (
+    <div className={`p-8 rounded-xl shadow-lg ${color} h-full`}>
+      <h2 className="text-4xl font-extrabold text-blue-900 mb-6 flex items-center">
+        <Home className="w-8 h-8 mr-3" /> HarryNico Market & Cie
+      </h2>
+      <div className="grid md:grid-cols-2 gap-8">
+        <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-blue-500">
+          <h3 className="text-2xl font-semibold text-blue-800 mb-4">Identité du Magasin</h3>
+          <p className="text-gray-700 mb-2"><span className="font-medium">Nom:</span> HarryNico Market & Cie</p>
+          <p className="text-gray-700 mb-2"><span className="font-medium">Adresse:</span> Rue du Commerce, 75001 Paris</p>
+          <p className="text-gray-700 mb-2"><span className="font-medium">Slogan:</span> Le marché qui vous sourit !</p>
+        </div>
+        <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-teal-500">
+          <h3 className="text-2xl font-semibold text-teal-800 mb-4">Identité du Gérant</h3>
+          <p className="text-gray-700 mb-2"><span className="font-medium">Nom du Gérant:</span> Monsieur Harry ou Madame Nico</p>
+          <p className="text-gray-700 mb-2"><span className="font-medium">Contact:</span> gerant@harrynico.com</p>
+          <p className="text-gray-700 mb-2"><span className="font-medium">ID Utilisateur (Firestore):</span> <span className="text-xs break-all bg-gray-100 p-1 rounded">{userId || "Chargement..."}</span></p>
+        </div>
+      </div>
+    </div>
+  );
+
+  // 2. Gestion des Produits
+  const ProductManagementView = ({ color }) => {
+    const [editingProduct, setEditingProduct] = useState(null);
+    const [formData, setFormData] = useState({ id: null, name: '', price: 0, cost: 0, stock: 0, emoji: '🥕' });
+
+    useEffect(() => {
+      if (editingProduct) {
+        setFormData(editingProduct);
+      } else {
+        setFormData({ id: null, name: '', price: 0, cost: 0, stock: 0, emoji: '🥕' });
+      }
+    }, [editingProduct]);
+
+    const handleChange = (e) => {
+      let { name, value, type } = e.target;
+      if (type === 'number') value = parseFloat(value) || 0;
+      setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      handleSaveProduct(formData);
+      setEditingProduct(null);
+    };
+
+    const EMOJIS = ['🥕', '🍎', '🥩', '🥛', '🍞', '🧼', '💻', '💡', '💊', '👕'];
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full overflow-y-auto`}>
+        <h2 className="text-3xl font-bold text-orange-900 mb-6 flex items-center">
+          <ShoppingBag className="w-6 h-6 mr-2" /> Gestion des Produits
+        </h2>
+
+        {/* Formulaire d'Ajout/Édition */}
+        <div className="bg-white p-6 rounded-lg shadow-md mb-8 border-l-4 border-orange-500">
+          <h3 className="text-xl font-semibold mb-4">{editingProduct ? "Modifier le Produit" : "Ajouter un Nouveau Produit"}</h3>
+          <form onSubmit={handleSubmit} className="grid md:grid-cols-3 gap-4">
+            <input name="name" value={formData.name} onChange={handleChange} placeholder="Nom du Produit" required className="p-2 border rounded-md" />
+            <input name="price" type="number" value={formData.price} onChange={handleChange} placeholder="Prix de Vente (€)" required className="p-2 border rounded-md" min="0" step="0.01" />
+            <input name="cost" type="number" value={formData.cost} onChange={handleChange} placeholder="Coût d'Achat (€)" required className="p-2 border rounded-md" min="0" step="0.01" />
+            <input name="stock" type="number" value={formData.stock} onChange={handleChange} placeholder="Stock Actuel" required className="p-2 border rounded-md" min="0" />
+            <div className="flex items-center space-x-2 border p-2 rounded-md">
+              <label>Émoji:</label>
+              <select name="emoji" value={formData.emoji} onChange={handleChange} className="p-1 border rounded-md flex-grow">
+                {EMOJIS.map(e => <option key={e} value={e}>{e}</option>)}
+              </select>
+            </div>
+            <div className="flex space-x-2">
+              <button type="submit" className="bg-orange-600 text-white p-2 rounded-md hover:bg-orange-700 transition flex-grow">
+                {editingProduct ? "Sauvegarder" : "Ajouter"}
+              </button>
+              {editingProduct && (
+                <button type="button" onClick={() => setEditingProduct(null)} className="bg-gray-300 text-gray-800 p-2 rounded-md hover:bg-gray-400 transition">
+                  Annuler
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
+
+        {/* Liste des Produits (Tableau Coloré) */}
+        <div className="bg-white p-6 rounded-lg shadow-lg">
+          <h3 className="text-xl font-semibold mb-4">Inventaire Actuel ({products.length})</h3>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-orange-200">
+              <thead className="bg-orange-100 text-orange-800 uppercase text-sm">
+                <tr>
+                  <th className="px-6 py-3 text-left font-medium">Émoji</th>
+                  <th className="px-6 py-3 text-left font-medium">Nom</th>
+                  <th className="px-6 py-3 text-left font-medium">Prix Vente (€)</th>
+                  <th className="px-6 py-3 text-left font-medium">Coût Achat (€)</th>
+                  <th className="px-6 py-3 text-left font-medium">Marge Unitaire (€)</th>
+                  <th className="px-6 py-3 text-left font-medium">Stock</th>
+                  <th className="px-6 py-3 text-left font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-orange-100">
+                {products.map(p => {
+                  const unitMargin = (p.price - p.cost).toFixed(2);
+                  const stockColor = p.stock < 10 ? 'bg-red-100' : p.stock < 50 ? 'bg-yellow-100' : '';
+                  return (
+                    <tr key={p.id} className={`hover:bg-orange-50 ${stockColor}`}>
+                      <td className="px-6 py-4 whitespace-nowrap text-2xl">{p.emoji}</td>
+                      <td className="px-6 py-4 whitespace-nowrap font-medium text-gray-900">{p.name}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">{p.price.toFixed(2)}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">{p.cost.toFixed(2)}</td>
+                      <td className={`px-6 py-4 whitespace-nowrap font-bold ${unitMargin > 0 ? 'text-green-600' : 'text-red-600'}`}>{unitMargin}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">{p.stock}</td>
+                      <td className="px-6 py-4 whitespace-nowrap space-x-2">
+                        <button onClick={() => setEditingProduct(p)} className="text-orange-600 hover:text-orange-900 font-medium">Éditer</button>
+                        <button onClick={() => handleDeleteProduct(p.id)} className="text-red-600 hover:text-red-900 font-medium">Supprimer</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 3. Commande de Produits & Stocks
+  const OrderingView = ({ color }) => {
+    const [selectedProduct, setSelectedProduct] = useState('');
+    const [quantity, setQuantity] = useState(1);
+    const [type, setType] = useState('IN'); // 'IN' or 'OUT'
+
+    const handleTransaction = (e) => {
+      e.preventDefault();
+      if (!selectedProduct || quantity <= 0) {
+        alertMessage("Veuillez sélectionner un produit et une quantité valide.", true);
+        return;
+      }
+      handleStockTransaction(selectedProduct, type, quantity);
+      setQuantity(1);
+    };
+
+    // Bilan des stocks entrant et sortant
+    const { totalIn, totalOut, inHistory, outHistory } = useMemo(() => {
+      const inH = stockHistory.filter(t => t.type === 'IN');
+      const outH = stockHistory.filter(t => t.type === 'OUT');
+      const totalIn = inH.reduce((sum, t) => sum + t.quantity, 0);
+      const totalOut = outH.reduce((sum, t) => sum + t.quantity, 0);
+      return { totalIn, totalOut, inHistory: inH, outHistory: outH };
+    }, [stockHistory]);
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full overflow-y-auto`}>
+        <h2 className="text-3xl font-bold text-purple-900 mb-6 flex items-center">
+          <Truck className="w-6 h-6 mr-2" /> Commande de Produits & Stocks
+        </h2>
+
+        {/* Section Transaction */}
+        <div className="bg-white p-6 rounded-lg shadow-md mb-8 border-l-4 border-purple-500">
+          <h3 className="text-xl font-semibold mb-4">Enregistrer une Transaction</h3>
+          <form onSubmit={handleTransaction} className="grid md:grid-cols-4 gap-4 items-end">
+            <select value={selectedProduct} onChange={(e) => setSelectedProduct(e.target.value)} required className="p-2 border rounded-md">
+              <option value="">Sélectionner un produit</option>
+              {products.map(p => (
+                <option key={p.id} value={p.id}>{p.emoji} {p.name} (Stock: {p.stock})</option>
+              ))}
+            </select>
+            <input type="number" value={quantity} onChange={(e) => setQuantity(parseInt(e.target.value))} min="1" required placeholder="Quantité" className="p-2 border rounded-md" />
+            <select value={type} onChange={(e) => setType(e.target.value)} required className="p-2 border rounded-md">
+              <option value="IN">Entrée de Stock</option>
+              <option value="OUT">Sortie de Stock</option>
+            </select>
+            <button type="submit" className="bg-purple-600 text-white p-2 rounded-md hover:bg-purple-700 transition">
+              Enregistrer l'Opération
+            </button>
+          </form>
+        </div>
+
+        {/* Bilan des Stocks Entrants et Sortants */}
+        <div className="grid md:grid-cols-2 gap-6 mb-8">
+            <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-green-500">
+                <h3 className="text-2xl font-semibold text-green-700 mb-2">Bilan des Stocks Entrants</h3>
+                <p className="text-3xl font-bold">{totalIn.toLocaleString()} unités</p>
+            </div>
+            <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-red-500">
+                <h3 className="text-2xl font-semibold text-red-700 mb-2">Bilan des Stocks Sortants</h3>
+                <p className="text-3xl font-bold">{totalOut.toLocaleString()} unités</p>
+            </div>
+        </div>
+
+        {/* Historique des Transactions (Tableau Coloré) */}
+        <div className="bg-white p-6 rounded-lg shadow-lg">
+          <h3 className="text-xl font-semibold mb-4">Historique Récent des Mouvements de Stock</h3>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-purple-200">
+              <thead className="bg-purple-100 text-purple-800 uppercase text-sm">
+                <tr>
+                  <th className="px-6 py-3 text-left font-medium">Type</th>
+                  <th className="px-6 py-3 text-left font-medium">Produit</th>
+                  <th className="px-6 py-3 text-right font-medium">Quantité</th>
+                  <th className="px-6 py-3 text-left font-medium">Date</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-purple-100">
+                {stockHistory.map((t) => {
+                  const isIncoming = t.type === 'IN';
+                  const product = products.find(p => p.id === t.productId);
+                  return (
+                    <tr key={t.id} className={`hover:bg-purple-50 ${isIncoming ? 'bg-green-50' : 'bg-red-50'}`}>
+                      <td className={`px-6 py-4 whitespace-nowrap font-bold ${isIncoming ? 'text-green-700' : 'text-red-700'}`}>{isIncoming ? 'Entrée' : 'Sortie'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">{product ? product.emoji + ' ' + product.name : t.productName}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-right font-mono">{t.quantity}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">{t.date.toLocaleDateString()} {t.date.toLocaleTimeString()}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 4. Dépense Quotidienne
+  const ExpensesView = ({ color }) => {
+    const [expenses, setExpenses] = useState(dailyExpenses);
+
+    useEffect(() => {
+      setExpenses(dailyExpenses);
+    }, [dailyExpenses]);
+
+    const handleChange = (e) => {
+      let { name, value } = e.target;
+      setExpenses(prev => ({ ...prev, [name]: parseFloat(value) || 0 }));
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      handleUpdateDailyExpenses(expenses);
+    };
+
+    // Calcul du total journalier des dépenses (hors coût des produits achetés, qui est COGS)
+    const totalDailyExpense = useMemo(() => {
+      return (
+        (expenses.thievesLoss || 0) +
+        (expenses.rentCost / 30 || 0) + 
+        (expenses.electricityCost / 30 || 0) +
+        (expenses.salaries / 30 || 0) +
+        (expenses.otherCosts || 0)
+      ).toFixed(2);
+    }, [expenses]);
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full overflow-y-auto`}>
+        <h2 className="text-3xl font-bold text-rose-900 mb-6 flex items-center">
+          <DollarSign className="w-6 h-6 mr-2" /> Dépense Quotidienne
+        </h2>
+
+        <div className="bg-white p-6 rounded-lg shadow-md border-l-4 border-rose-500">
+          <h3 className="text-xl font-semibold mb-4">Enregistrement pour le <span className="text-rose-600">{dailyExpenses.date}</span></h3>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {[
+              { label: "Argents perdu à cause des voleurs (€)", name: "thievesLoss" },
+              { label: "Coûts des produits achetés (Total Annuel/Mois - À des fins de COGS)", name: "productsCostBought" }, // Note: This field is just for display/record, COGS is calculated based on sales
+              { label: "Coût du Loyer (Mensuel - €)", name: "rentCost" },
+              { label: "Coût de l'électricité (Mensuel - €)", name: "electricityCost" },
+              { label: "Salaires des Employées (Mensuel - €)", name: "salaries" },
+              { label: "Autres coûts (Journalier - €)", name: "otherCosts" },
+            ].map(({ label, name }) => (
+              <div key={name} className="flex flex-col sm:flex-row sm:items-center justify-between">
+                <label className="text-gray-700 font-medium mb-1 sm:mb-0">{label}:</label>
+                <input
+                  name={name}
+                  type="number"
+                  value={expenses[name] || 0}
+                  onChange={handleChange}
+                  required
+                  className="p-2 border rounded-md w-full sm:w-1/3 text-right"
+                  min="0"
+                  step="0.01"
+                />
+              </div>
+            ))}
+            <div className="pt-4 border-t border-rose-200">
+              <p className="text-lg font-bold text-rose-800">Total des Frais Opérationnels Journaliers Estimés (hors COGS): {totalDailyExpense} €</p>
+            </div>
+            <button type="submit" className="bg-rose-600 text-white p-2 rounded-md hover:bg-rose-700 transition w-full">
+              Sauvegarder les Dépenses
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  };
+
+  // 5. Bilan Financier
+  const FinancialView = ({ color }) => {
+    // Note: Dans une vraie app, on chargerait l'historique de 'daily_stats' et 'daily_expenses'
+    // Ici on simule l'agrégation en utilisant les données journalières actuelles comme base.
+
+    const metrics = calculateDailyMetrics;
+    const isPositive = parseFloat(metrics.dailyBalance) >= 0;
+
+    const dataPoints = [
+      { label: "Solde Journalier (Bénéfice Net)", value: metrics.dailyBalance + ' €', color: isPositive ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800' },
+      { label: "Bilan Mensuel (Estimé)", value: (metrics.dailyBalance * 30).toFixed(2) + ' €', color: 'bg-indigo-100 text-indigo-800' },
+      { label: "Bilan Trimestriel (Estimé)", value: (metrics.dailyBalance * 90).toFixed(2) + ' €', color: 'bg-purple-100 text-purple-800' },
+      { label: "Bilan Semestriel (Estimé)", value: (metrics.dailyBalance * 180).toFixed(2) + ' €', color: 'bg-pink-100 text-pink-800' },
+      { label: "Bilan Annuel (Estimé)", value: (metrics.dailyBalance * 365).toFixed(2) + ' €', color: 'bg-teal-100 text-teal-800' },
+    ];
+    
+    // Bilan des stocks (réutilisation de la logique de OrderingView)
+    const { totalIn, totalOut } = useMemo(() => {
+        // CORRECTION: Récupération de la référence de collection
+        const stockHistoryRef = getUserCollection('stock_history');
+        
+        const inH = stockHistory.filter(t => t.type === 'IN');
+        const outH = stockHistory.filter(t => t.type === 'OUT');
+        const totalIn = inH.reduce((sum, t) => sum + t.quantity, 0);
+        const totalOut = outH.reduce((sum, t) => sum + t.quantity, 0);
+        return { totalIn, totalOut };
+    }, [stockHistory]);
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full overflow-y-auto`}>
+        <h2 className="text-3xl font-bold text-cyan-900 mb-6 flex items-center">
+          <BarChart3 className="w-6 h-6 mr-2" /> Bilan Financier
+        </h2>
+
+        {/* Bilans Périodiques */}
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+          {dataPoints.map((item, index) => (
+            <div key={index} className={`p-5 rounded-lg shadow-md ${item.color}`}>
+              <p className="text-lg font-medium">{item.label}</p>
+              <p className="text-3xl font-extrabold mt-1">{item.value}</p>
+            </div>
+          ))}
+        </div>
+        
+        {/* Bilan des Stocks Entrant et Sortant */}
+        <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-cyan-500">
+            <h3 className="text-2xl font-semibold text-cyan-800 mb-4">Bilan des Stocks (Total depuis le début)</h3>
+            <div className="flex justify-around space-x-4">
+                <div className="text-center p-4 bg-green-50 rounded-lg flex-1">
+                    <p className="text-sm font-medium text-green-700">Stocks Entrants</p>
+                    <p className="text-3xl font-bold text-green-900">{totalIn.toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">unités commandées</p>
+                </div>
+                <div className="text-center p-4 bg-red-50 rounded-lg flex-1">
+                    <p className="text-sm font-medium text-red-700">Stocks Sortants</p>
+                    <p className="text-3xl font-bold text-red-900">{totalOut.toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">unités vendues/perdues</p>
+                </div>
+            </div>
+        </div>
+      </div>
+    );
+  };
+
+  // 6. Statistiques du Jour
+  const StatsView = ({ color }) => {
+    const [stats, setStats] = useState(dailyStats);
+
+    useEffect(() => {
+      setStats(dailyStats);
+    }, [dailyStats]);
+
+    const handleChange = (e) => {
+      let { name, value } = e.target;
+      setStats(prev => ({ ...prev, [name]: parseFloat(value) || 0 }));
+    };
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      handleUpdateDailyStats(stats);
+    };
+
+    const isDataLoaded = dailyStats && dailyStats.date;
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full overflow-y-auto`}>
+        <h2 className="text-3xl font-bold text-amber-900 mb-6 flex items-center">
+          <BarChart3 className="w-6 h-6 mr-2" /> Statistique du Jour
+        </h2>
+
+        {/* Formulaire de saisie des statistiques */}
+        <div className="bg-white p-6 rounded-lg shadow-md mb-8 border-l-4 border-amber-500">
+          <h3 className="text-xl font-semibold mb-4">Saisie des Données pour le <span className="text-amber-600">{dailyStats.date}</span></h3>
+          <form onSubmit={handleSubmit} className="grid md:grid-cols-2 gap-4">
+            {[
+              { label: "Produits non trouvés (Plaintes)", name: "notFounds", icon: <Frown className="w-4 h-4 text-gray-500" /> },
+              { label: "Produits trop chers (Plaintes)", name: "tooExpensive", icon: <DollarSign className="w-4 h-4 text-gray-500" /> },
+              { label: "Nombre de vols (Incidents)", name: "thefts", icon: <Wrench className="w-4 h-4 text-gray-500" /> },
+              { label: "Plaintes concernant les saletés", name: "dirtComplaints", icon: <Package className="w-4 h-4 text-gray-500" /> },
+              // Champs nécessaires pour l'Analyse de Rentabilité (visibles pour la saisie)
+              { label: "Total des Ventes (Chiffre d'Affaires)", name: "dailySales" , step: "0.01", min: "0" },
+              { label: "Coût Total des Produits Vendus (COGS)", name: "productsCostTotal", step: "0.01", min: "0" },
+            ].map(({ label, name, icon, step = "1", min = "0" }) => {
+              return (
+                <div key={name} className="flex items-center space-x-2">
+                  {icon}
+                  <label className="text-gray-700 flex-grow">{label}:</label>
+                  <input
+                    name={name}
+                    type="number"
+                    value={stats[name] || 0}
+                    onChange={handleChange}
+                    required
+                    className="p-2 border rounded-md w-24 text-right"
+                    min={min}
+                    step={step}
+                  />
+                </div>
+              );
+            })}
+            <button type="submit" className="col-span-2 bg-amber-600 text-white p-2 rounded-md hover:bg-amber-700 transition">
+              Sauvegarder les Statistiques
+            </button>
+          </form>
+        </div>
+
+        {/* Tableau des Statistiques du Jour */}
+        <div className="bg-white p-6 rounded-lg shadow-lg">
+          <h3 className="text-xl font-semibold mb-4">Synthèse des Problèmes ({dailyStats.date})</h3>
+          {isDataLoaded ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-amber-200">
+                <thead className="bg-amber-100 text-amber-800 uppercase text-sm">
+                  <tr>
+                    <th className="px-6 py-3 text-left font-medium">Indicateur</th>
+                    <th className="px-6 py-3 text-right font-medium">Valeur</th>
+                    <th className="px-6 py-3 text-left font-medium">Interprétation</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-amber-100">
+                  <tr className="hover:bg-amber-50">
+                    <td className="px-6 py-4 whitespace-nowrap font-medium text-gray-900">Produits non trouvés</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-lg font-bold">{dailyStats.notFounds}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">{dailyStats.notFounds > 5 ? "Urgence stock !" : "Peut-être dû au réassort."}</td>
+                  </tr>
+                  <tr className="hover:bg-amber-50">
+                    <td className="px-6 py-4 whitespace-nowrap font-medium text-gray-900">Plaintes : Trop chers</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-lg font-bold">{dailyStats.tooExpensive}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">{dailyStats.tooExpensive > 3 ? "Revoir les prix de la concurrence." : "Niveau acceptable."}</td>
+                  </tr>
+                  <tr className="hover:bg-amber-50">
+                    <td className="px-6 py-4 whitespace-nowrap font-medium text-gray-900">Nombre de vols</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-lg font-bold">{dailyStats.thefts}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">{dailyStats.thefts > 0 ? "Renforcer la sécurité." : "Bonne journée."}</td>
+                  </tr>
+                  <tr className="hover:bg-amber-50">
+                    <td className="px-6 py-4 whitespace-nowrap font-medium text-gray-900">Plaintes : Saletés</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-lg font-bold">{dailyStats.dirtComplaints}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">{dailyStats.dirtComplaints > 0 ? "Faire un ménage approfondi." : "Propreté satisfaisante."}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-gray-500">Aucune donnée statistique enregistrée pour aujourd'hui.</p>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // 7. Analyse de Rentabilité Journalière
+  const ProfitabilityView = ({ color }) => {
+    const metrics = calculateDailyMetrics;
+    const isGrossPositive = parseFloat(metrics.grossMargin) >= 0;
+    const isNetPositive = parseFloat(metrics.netMargin) >= 0;
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full`}>
+        <h2 className="text-3xl font-bold text-emerald-900 mb-6 flex items-center">
+          <TrendingUp className="w-6 h-6 mr-2" /> Analyse de Rentabilité Journalière
+        </h2>
+
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+            {/* Colonne 1: Ventes et Coûts */}
+            <div className="bg-white p-6 rounded-lg shadow-md border-t-4 border-emerald-500">
+                <h3 className="text-xl font-semibold text-emerald-800 mb-4">Ventes & Coûts</h3>
+                <p className="text-lg mb-2"><span className="font-medium">Chiffre d'Affaires (CA):</span> <span className="font-bold text-2xl text-blue-600">{metrics.totalDailyRevenue} €</span></p>
+                <p className="text-lg mb-2"><span className="font-medium">Coût des Marchandises Vendues (COGS):</span> <span className="font-bold text-2xl text-red-600">{metrics.totalDailyCOGS} €</span></p>
+                <p className="text-lg mb-2"><span className="font-medium">Frais Opérationnels Journaliers:</span> <span className="font-bold text-2xl text-red-600">{metrics.totalDailyExpenses} €</span></p>
+            </div>
+
+            {/* Colonne 2: Marge Brute */}
+            <div className={`p-6 rounded-lg shadow-md border-t-4 ${isGrossPositive ? 'bg-green-50 border-green-500' : 'bg-red-50 border-red-500'}`}>
+                <h3 className="text-xl font-semibold text-gray-800 mb-4">Marge Brute (CA - COGS)</h3>
+                <p className="text-4xl font-extrabold mt-1">{metrics.grossMargin} €</p>
+                <p className={`mt-2 ${isGrossPositive ? 'text-green-700' : 'text-red-700'} font-medium`}>
+                    {isGrossPositive ? "Votre marge est positive avant les frais fixes !" : "Attention: Le coût des produits vendus dépasse vos revenus."}
+                </p>
+            </div>
+
+            {/* Colonne 3: Marge Nette */}
+            <div className={`p-6 rounded-lg shadow-md border-t-4 ${isNetPositive ? 'bg-emerald-100 border-emerald-500' : 'bg-pink-100 border-pink-500'}`}>
+                <h3 className="text-xl font-semibold text-gray-800 mb-4">Marge Nette (Bénéfice Net)</h3>
+                <p className="text-4xl font-extrabold mt-1">{metrics.netMargin} €</p>
+                <p className={`mt-2 ${isNetPositive ? 'text-emerald-700' : 'text-pink-700'} font-medium`}>
+                    {isNetPositive ? "Félicitations, vous êtes rentable pour la journée." : "Action requise: les dépenses dépassent les profits bruts."}
+                </p>
+            </div>
+        </div>
+
+        <p className="text-sm text-gray-600 mt-4 p-4 bg-gray-100 rounded-md">
+            *L'analyse est basée sur les données enregistrées aujourd'hui. Assurez-vous d'entrer votre Chiffre d'Affaires et Coût des Marchandises Vendues dans l'espace "Statistique du Jour" et les frais fixes dans "Dépense Quotidienne".
+        </p>
+      </div>
+    );
+  };
+
+  // 8. Téléchargement des Bilans (Simulé)
+  const ExportView = ({ color }) => {
+    const handleDownload = (format) => {
+      alertMessage(`Téléchargement du Bilan au format ${format} simulé. (Fonctionnalité complète non disponible dans cette démo en un seul fichier)`);
+    };
+
+    return (
+      <div className={`p-8 rounded-xl shadow-lg ${color} h-full`}>
+        <h2 className="text-3xl font-bold text-gray-900 mb-6 flex items-center">
+          <Download className="w-6 h-6 mr-2" /> Téléchargement des Bilans
+        </h2>
+
+        <div className="bg-white p-6 rounded-lg shadow-md border-l-4 border-gray-500">
+          <p className="text-lg mb-6">Sélectionnez le format pour télécharger l'ensemble des bilans agrégés (Journaliers, Mensuels, Stocks, etc.).</p>
+          <div className="flex space-x-4">
+            <button onClick={() => handleDownload('Excel')} className="flex items-center bg-green-600 text-white px-6 py-3 rounded-md hover:bg-green-700 transition font-bold shadow-lg">
+              Télécharger Excel (.xlsx)
+            </button>
+            <button onClick={() => handleDownload('PDF')} className="flex items-center bg-red-600 text-white px-6 py-3 rounded-md hover:bg-red-700 transition font-bold shadow-lg">
+              Télécharger PDF (.pdf)
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // --- Composant Conteneur de Vue ---
+  const ViewContainer = ({ view, children }) => {
+    const colorMap = {
+      [VIEWS.HOME]: 'bg-blue-50',
+      [VIEWS.PRODUCTS]: 'bg-orange-50',
+      [VIEWS.ORDERING]: 'bg-purple-50',
+      [VIEWS.EXPENSES]: 'bg-rose-50',
+      [VIEWS.FINANCIAL]: 'bg-cyan-50',
+      [VIEWS.STATS]: 'bg-amber-50',
+      [VIEWS.PROFITABILITY]: 'bg-emerald-50',
+      [VIEWS.EXPORT]: 'bg-gray-100',
+    };
+    const colorClass = colorMap[view] || 'bg-gray-50';
+
+    if (isLoading) {
+      return (
+        <div className="flex justify-center items-center h-full text-xl text-blue-500">
+          Chargement des données...
+        </div>
+      );
+    }
+
+    if (error) {
+        return (
+          <div className="flex justify-center items-center h-full text-red-500 bg-red-100 p-8 rounded-lg m-8">
+            Erreur critique: {error}
+          </div>
+        );
+      }
+
+    return (
+      <div className="flex-1 p-4 md:p-8 h-full overflow-y-auto">
+        {React.cloneElement(children, { color: colorClass })}
+      </div>
+    );
+  };
+
+  // --- Rendu de la Vue Actuelle ---
+  const renderView = () => {
+    switch (currentView) {
+      case VIEWS.HOME:
+        return <HomeView />;
+      case VIEWS.PRODUCTS:
+        return <ProductManagementView />;
+      case VIEWS.ORDERING:
+        return <OrderingView />;
+      case VIEWS.EXPENSES:
+        return <ExpensesView />;
+      case VIEWS.FINANCIAL:
+        return <FinancialView />;
+      case VIEWS.STATS:
+        return <StatsView />;
+      case VIEWS.PROFITABILITY:
+        return <ProfitabilityView />;
+      case VIEWS.EXPORT:
+        return <ExportView />;
+      default:
+        return <HomeView />;
+    }
+  };
+
+  // --- Composant de Navigation ---
+  const NavItem = ({ view, icon: Icon }) => (
+    <button
+      onClick={() => setCurrentView(view)}
+      className={`flex items-center p-3 rounded-lg w-full text-left transition ${
+        currentView === view
+          ? 'bg-blue-700 text-white shadow-md'
+          : 'text-blue-200 hover:bg-blue-800 hover:text-white'
+      }`}
+    >
+      <Icon className="w-5 h-5 mr-3" />
+      <span className="font-medium">{view}</span>
+    </button>
+  );
+
+  return (
+    <div className="flex h-screen w-full bg-gray-100 font-inter">
+      {/* Sidebar de Navigation */}
+      <div className="bg-blue-900 w-64 flex flex-col p-4 shadow-2xl">
+        <div className="text-white text-2xl font-bold mb-8 p-2 border-b border-blue-700">
+          HarryNico Market&Cie
+        </div>
+        <nav className="flex flex-col space-y-2 flex-grow">
+          <NavItem view={VIEWS.HOME} icon={Home} />
+          <div className="py-2 border-t border-blue-800 my-2"></div>
+          
+          <p className="text-blue-400 text-sm font-semibold uppercase px-2 mb-1">Opérations</p>
+          <NavItem view={VIEWS.PRODUCTS} icon={ShoppingBag} />
+          <NavItem view={VIEWS.ORDERING} icon={Truck} />
+          <NavItem view={VIEWS.EXPENSES} icon={DollarSign} />
+          
+          <div className="py-2 border-t border-blue-800 my-2"></div>
+
+          <p className="text-blue-400 text-sm font-semibold uppercase px-2 mb-1">Analyse & Bilan</p>
+          <NavItem view={VIEWS.STATS} icon={BarChart3} />
+          <NavItem view={VIEWS.PROFITABILITY} icon={TrendingUp} />
+          <NavItem view={VIEWS.FINANCIAL} icon={DollarSign} />
+          
+          <div className="py-2 border-t border-blue-800 my-2"></div>
+
+          <p className="text-blue-400 text-sm font-semibold uppercase px-2 mb-1">Outils</p>
+          <NavItem view={VIEWS.EXPORT} icon={Download} />
+          
+          <div className="flex-grow"></div>
+          <div className="text-blue-400 text-xs mt-4 p-2">
+            Connecté: {userId ? 'Oui' : 'Non'}
+          </div>
+
+        </nav>
+      </div>
+
+      {/* Contenu Principal */}
+      <ViewContainer view={currentView}>
+        {renderView()}
+      </ViewContainer>
+      
+      {/* Alerte Modale */}
+      <AlertModal />
+    </div>
+  );
+};
+
+export default App;
